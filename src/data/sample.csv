@@ -1,0 +1,6 @@
+id,nombre,email,edad,ciudad,salario,departamento
+1,Juan Pérez,juan@email.com,30,Madrid,45000,Ventas
+2,María García,maria@email.com,28,Barcelona,52000,Marketing
+3,Carlos López,carlos@email.com,35,Valencia,61000,IT
+4,Ana Martínez,ana@email.com,32,Sevilla,48000,RH
+5,Luis Fernández,luis@email.com,40,Madrid,75000,IT

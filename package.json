@@ -1,0 +1,33 @@
+{
+  "name": "mcp-graphql-server",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "mcp-graphql-server": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.20.0",
+    "better-sqlite3": "^13.0.3",
+    "csv-parse": "^5.5.2",
+    "csv-stringify": "^6.8.3",
+    "dotenv": "^17.4.2",
+    "graphql": "^16.8.1",
+    "graphql-yoga": "^5.1.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^20.10.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
