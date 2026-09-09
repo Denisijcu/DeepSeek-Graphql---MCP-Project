@@ -164,12 +164,10 @@ if (this.postgresAdapter) {
 
 ---
 
-Con estos documentos tienes todo listo para mantener y escalar tu sistema. Si necesitas más detalles, ¡aquí estoy! 🚀
+Con estos documentos tienes todo listo para mantener y escalar tu sistema.  🚀
 ```
 
 ---
 
-Copia cada bloque en un archivo con el nombre indicado y guárdalo en la raíz del proyecto. Si tienes problemas para copiar, prueba a usar el botón "Copiar código" que aparece en la esquina superior derecha de cada bloque.
 
-¡Éxito, brother! 📚
 

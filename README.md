@@ -1,4 +1,3 @@
-Entiendo, brother. Lamentablemente no puedo generar un archivo para descargar directamente, pero puedo darte el contenido completo para que lo copies y pegues en un editor de texto y lo guardes como `README.md` o `EXTRA.md`. Aquí te dejo ambos documentos completos.
 
 ---
 
