@@ -6,6 +6,8 @@
 ```markdown
 # MCP GraphQL Server Multi-Fuente
 
+
+
 Servidor MCP (Model Context Protocol) que expone una API GraphQL dinámica sobre múltiples fuentes de datos: CSV, Google Sheets, SQLite, PostgreSQL, MySQL, MongoDB y Oracle.
 
 ## ✨ Características

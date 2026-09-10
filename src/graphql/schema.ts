@@ -78,9 +78,48 @@ export function createDynamicSchema(adapter: DataAdapter, options?: { directives
 
   const OrderByInputType = new GraphQLInputObjectType({
     name: 'OrderByInput',
+    description:
+      'orderBy espera una LISTA. Ej: orderBy: [{ field: "salario", direction: "desc" }]',
     fields: {
-      field: { type: new GraphQLNonNull(GraphQLString) },
-      direction: { type: GraphQLString, defaultValue: 'asc' },
+      field: {
+        type: new GraphQLNonNull(GraphQLString),
+        description: 'Nombre exacto del campo.',
+      },
+      direction: {
+        type: GraphQLString,
+        defaultValue: 'asc',
+        description: '"asc" o "desc".',
+      },
+    },
+  });
+
+  // ---------- Agregacion ----------
+  //
+  // Se anadio despues de observar que el modelo, al no encontrar
+  // agregaciones, se traia TODOS los registros y calculaba la media el
+  // mismo. Los nombres del resultado son FIJOS a proposito: con alias
+  // dinamicos el modelo tiene que adivinar como se llamara el campo.
+  const AggregateResultType = new GraphQLObjectType({
+    name: 'AggregateResult',
+    description: 'Resultado de agregar un campo numerico.',
+    fields: {
+      field: { type: GraphQLString, description: 'Campo agregado.' },
+      count: {
+        type: GraphQLInt,
+        description: 'Filas que pasaron el filtro, con valor o sin el.',
+      },
+      countNoNulos: {
+        type: GraphQLInt,
+        description: 'Filas con valor. Base de avg, sum, min y max.',
+      },
+      sum: { type: GraphQLFloat },
+      avg: { type: GraphQLFloat },
+      min: { type: GraphQLFloat },
+      max: { type: GraphQLFloat },
+      aviso: {
+        type: GraphQLString,
+        description: 'Si viene, transmiteselo al usuario.',
+      },
     },
   });
 
@@ -95,8 +134,25 @@ export function createDynamicSchema(adapter: DataAdapter, options?: { directives
   fields._id = { type: GraphQLString, description: 'ID interno' };
   fields._index = { type: GraphQLInt, description: 'Índice del registro' };
 
+  // El nombre del tipo tiene que identificar la FUENTE.
+  //
+  // Con todas las fuentes generando un tipo llamado "Record", el modelo
+  // acumula en su contexto varios esquemas homonimos con campos distintos
+  // y no tiene forma de saber cual esta activo. Ese es el motivo de que
+  // confundiera la tabla de SQLite con la hoja de Google: para el las dos
+  // se llamaban igual.
+  const nombreFuente = adapter.getSourceName()
+    .replace(/[^a-zA-Z0-9]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase())
+    .join('');
+
   const RecordType = new GraphQLObjectType({
-    name: 'Record',
+    name: `Record${nombreFuente || 'Generico'}`,
+    description:
+      `Registro de la fuente activa: ${adapter.getSourceName()}. ` +
+      `Campos disponibles: ${Object.keys(schema).join(', ')}.`,
     fields,
   });
 
@@ -116,14 +172,31 @@ export function createDynamicSchema(adapter: DataAdapter, options?: { directives
     fields: {
       records: {
         type: new GraphQLList(RecordType),
+        description:
+          `Registros de "${adapter.getSourceName()}", la fuente activa. ` +
+          `Tras switch_source, vuelve a pedir get_schema: los campos cambian.`,
         args: {
-          limit: { type: GraphQLInt },
-          offset: { type: GraphQLInt },
+          limit: {
+            type: GraphQLInt,
+            description: 'Maximo de filas. Por defecto 100.',
+          },
+          offset: { type: GraphQLInt, description: 'Filas a saltar.' },
           orderBy: { type: new GraphQLList(OrderByInputType) },
           where: { type: WhereInputType },
-          ...Object.fromEntries(
-            Object.keys(schema).map((key) => [key, { type: GraphQLString }])
-          ),
+          // Aqui habia ademas un argumento suelto por cada campo:
+          //
+          //   ...Object.fromEntries(
+          //     Object.keys(schema).map((key) => [key, { type: GraphQLString }])
+          //   ),
+          //
+          // Es decir, cada campo se podia filtrar de DOS maneras: por el
+          // argumento suelto y por where. Se pagaba dos veces en el
+          // esquema, y el modelo tenia dos caminos para la misma pregunta,
+          // que es justo lo contrario de lo que se quiere cuando el
+          // problema es que elija bien.
+          //
+          // where cubre todo lo que hacian los argumentos sueltos y ademas
+          // permite operadores. Los sueltos solo permitian igualdad.
         },
         resolve: resolvers.Query.records,
       },
@@ -132,24 +205,63 @@ export function createDynamicSchema(adapter: DataAdapter, options?: { directives
         args: { id: { type: new GraphQLNonNull(GraphQLID) } },
         resolve: resolvers.Query.record,
       },
-      departamentos: {
-        type: new GraphQLList(DepartmentType),
-        args: {
-          limit: { type: GraphQLInt },
-          offset: { type: GraphQLInt },
-        },
-        resolve: resolvers.Query.departamentos,
-      },
+      // ---------- Departamentos ----------
+      //
+      // Este tipo y su consulta estan escritos A MANO, no salen de la
+      // fuente. Antes se declaraban SIEMPRE, incluso en fuentes que no
+      // tienen tabla de departamentos: en el CSV, "departamento" es una
+      // columna de texto (Ventas, Marketing, IT) y no hay nada que
+      // consultar.
+      //
+      // Ofrecerle al modelo una consulta que en esa fuente no significa
+      // nada cuesta tokens y ademas induce a un error que luego hay que
+      // depurar. Ahora solo aparece donde existe de verdad.
+      ...(typeof (adapter as any).getDataFromSheet === 'function'
+        ? {
+            departamentos: {
+              type: new GraphQLList(DepartmentType),
+              description:
+                'Departamentos. Solo existe en fuentes con varias hojas.',
+              args: {
+                limit: { type: GraphQLInt },
+                offset: { type: GraphQLInt },
+              },
+              resolve: resolvers.Query.departamentos,
+            },
+          }
+        : {}),
       stats: {
         type: new GraphQLObjectType({
           name: 'DataStats',
           fields: {
-            totalRecords: { type: GraphQLInt },
-            source: { type: GraphQLString },
-            fields: { type: GraphQLString },
+            totalRecords: {
+              type: GraphQLInt,
+              description: 'Numero total de registros en la fuente.',
+            },
+            source: { type: GraphQLString, description: 'Nombre de la fuente activa.' },
+            fields: { type: GraphQLString, description: 'Campos disponibles.' },
           },
         }),
+        description:
+          'Resumen de la fuente. USA ESTO para "cuantos registros hay": ' +
+          'devuelve totalRecords sin traerse las filas.',
         resolve: resolvers.Query.stats,
+      },
+
+      aggregate: {
+        type: AggregateResultType,
+        description:
+          'count, sum, avg, min y max de un campo numerico, con filtro opcional. ' +
+          'USA ESTO para medias, sumas y maximos en vez de traerte los registros. ' +
+          'Ej: { aggregate(field: "salario") { avg max countNoNulos aviso } }',
+        args: {
+          field: {
+            type: new GraphQLNonNull(GraphQLString),
+            description: 'Campo a agregar. Debe existir en el esquema.',
+          },
+          where: { type: WhereInputType },
+        },
+        resolve: resolvers.Query.aggregate,
       },
     },
   });

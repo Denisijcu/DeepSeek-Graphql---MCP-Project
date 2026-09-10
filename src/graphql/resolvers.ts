@@ -102,6 +102,29 @@ export function createResolvers(adapter: DataAdapter & {
           fields: JSON.stringify(stats.fields),
         };
       },
+
+      // Agregacion sobre un campo numerico.
+      //
+      // Se anadio despues de observar al modelo traerse TODOS los
+      // registros para calcular una media en su respuesta. Con tres
+      // empleados funciona; con tres mil es traer tres mil filas al
+      // contexto para producir un numero.
+      aggregate: async (parent: any, args: any) => {
+        // aggregate vive en BaseAdapter, no en la interfaz DataAdapter.
+        // Se comprueba antes de llamar para dar un mensaje util en vez de
+        // un "is not a function".
+        const fn = (adapter as any).aggregate;
+        if (typeof fn !== 'function') {
+          throw new Error(
+            'Esta fuente no soporta agregaciones. Trae los registros con ' +
+            'records y calcula sobre ellos.'
+          );
+        }
+
+        const { field, where } = args;
+        const filters = buildFilters(where, {}, schema);
+        return fn.call(adapter, field, filters);
+      },
     },
 
     Mutation: {

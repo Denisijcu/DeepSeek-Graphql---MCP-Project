@@ -1,6 +1,6 @@
 // src/adapters/mongodb-adapter.ts
 import { BaseAdapter, QueryOptions, FieldType } from './base-adapter.js';
-import { MongoClient, Db, Collection } from 'mongodb';
+import { MongoClient, Db, Collection, ObjectId, type Filter, type Document } from 'mongodb';
 
 export class MongoDBAdapter extends BaseAdapter {
   private client: MongoClient | null = null;
@@ -51,28 +51,64 @@ export class MongoDBAdapter extends BaseAdapter {
     return result;
   }
 
+  /**
+   * Construye el filtro para buscar un documento por su identificador.
+   *
+   * En MongoDB el campo _id es un ObjectId, NO una cadena. Comparar
+   * { _id: "68b2f1..." } contra un ObjectId no coincide nunca, asi que la
+   * version anterior de este metodo no habria encontrado ningun documento
+   * aunque hubiera compilado.
+   *
+   * Se prueban las dos posibilidades:
+   *   - _id como ObjectId, si la cadena tiene forma valida de ObjectId
+   *   - un campo "id" propio del documento, que muchas colecciones traen
+   */
+  private filtroPorId(id: string): Filter<Document> {
+    const condiciones: Filter<Document>[] = [{ id: id }];
+
+    if (ObjectId.isValid(id)) {
+      condiciones.unshift({ _id: new ObjectId(id) });
+    }
+
+    return { $or: condiciones };
+  }
+
   async createRecord(record: Record<string, any>): Promise<any> {
     if (!this.collection) throw new Error('Colección no inicializada');
     const result = await this.collection.insertOne(record);
     await this.reloadData();
-    return record;
+    return { ...record, _id: result.insertedId };
   }
 
   async updateRecord(id: string, updates: Record<string, any>): Promise<any> {
     if (!this.collection) throw new Error('Colección no inicializada');
-    // Asumimos que el documento tiene un campo _id o id
-    const filter = { $or: [{ _id: id }, { id: id }] };
-    await this.collection.updateOne(filter, { $set: updates });
+
+    const resultado = await this.collection.updateOne(
+      this.filtroPorId(id),
+      { $set: updates }
+    );
+
+    // Si no coincidio ningun documento hay que decirlo. Devolver undefined
+    // en silencio hace pensar al modelo que la actualizacion funciono.
+    if (resultado.matchedCount === 0) {
+      throw new Error(`No existe ningun documento con id "${id}".`);
+    }
+
     await this.reloadData();
-    return this.data.find(doc => String(doc._id) === String(id) || String(doc.id) === String(id));
+    return this.data.find(
+      doc => String(doc._id) === String(id) || String(doc.id) === String(id)
+    );
   }
 
   async deleteRecord(id: string): Promise<boolean> {
     if (!this.collection) throw new Error('Colección no inicializada');
-    const filter = { $or: [{ _id: id }, { id: id }] };
-    await this.collection.deleteOne(filter);
+
+    const resultado = await this.collection.deleteOne(this.filtroPorId(id));
     await this.reloadData();
-    return true;
+
+    // Devolver el resultado REAL, no true siempre. Un borrado que no borro
+    // nada no es un borrado con exito.
+    return resultado.deletedCount > 0;
   }
 
   private inferSchema(records: any[]): void {

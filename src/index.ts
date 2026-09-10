@@ -66,11 +66,24 @@ class MCPGraphQLServer {
       const tools: Tool[] = [
         {
           name: 'graphql_query',
-          description: 'Ejecuta una consulta GraphQL contra la fuente de datos activa',
+          description:
+            'Ejecuta una consulta GraphQL contra la fuente de datos ACTIVA. ' +
+            'IMPORTANTE: llama primero a get_schema para saber que campos existen; ' +
+            'cada fuente tiene campos distintos y una consulta con un campo que no ' +
+            'existe falla. La consulta principal es records(...). No existe ningun ' +
+            'argumento "tabla" ni "coleccion": cada fuente expone UNA sola tabla, y ' +
+            'para cambiar de tabla hay que cambiar de fuente con switch_source.',
           inputSchema: {
             type: 'object',
             properties: {
-              query: { type: 'string', description: 'La consulta GraphQL a ejecutar' },
+              query: {
+                type: 'string',
+                description:
+                  'Consulta GraphQL. Ej: { records(limit: 10) { id nombre salario } } ' +
+                  'Con filtro: { records(where: { salario: { operator: gt, value: 50000 } }) ' +
+                  '{ nombre salario } }  Operadores: eq, neq, gt, gte, lt, lte, contains, ' +
+                  'startsWith, endsWith, in, between.',
+              },
               variables: { type: 'object', description: 'Variables opcionales', optional: true },
               hash: { type: 'string', description: 'Hash de consulta persistida', optional: true },
             },
@@ -104,11 +117,20 @@ class MCPGraphQLServer {
         },
         {
           name: 'switch_source',
-          description: 'Usa "sqlite" para trabajar con la base de datos SQLite.',
+          description:
+            'Cambia la fuente de datos activa. Solo hay UNA activa a la vez, y ' +
+            'todas las consultas van contra ella. Cada fuente tiene sus propios ' +
+            'campos, asi que DESPUES de cambiar hay que llamar a get_schema otra ' +
+            'vez: el esquema anterior ya no vale. Fuentes: "csv", "google-sheets" ' +
+            'y "sqlite".',
           inputSchema: {
             type: 'object',
             properties: {
-              source: { type: 'string', description: 'Nombre de la fuente: "csv", "google-sheets" o "sqlite"' },
+              source: {
+                type: 'string',
+                enum: ['csv', 'google-sheets', 'sqlite'],
+                description: 'Nombre exacto de la fuente: csv, google-sheets o sqlite',
+              },
             },
             required: ['source'],
           },
@@ -136,7 +158,11 @@ class MCPGraphQLServer {
         },
         {
           name: 'get_schema',
-          description: 'Obtiene el esquema de la fuente de datos activa, incluyendo consultas disponibles y fuentes',
+          description:
+            'Devuelve el esquema de la fuente ACTIVA: nombre de la fuente, campos ' +
+            'con su tipo, consultas disponibles y ejemplos. LLAMA A ESTA HERRAMIENTA ' +
+            'ANTES DE LA PRIMERA CONSULTA Y CADA VEZ QUE USES switch_source. Los ' +
+            'campos cambian de una fuente a otra.',
           inputSchema: { type: 'object', properties: {} },
         },
       ];
@@ -258,22 +284,94 @@ class MCPGraphQLServer {
     }
   }
 
+  /**
+   * Borrados pendientes de confirmar.
+   *
+   * Antes, la confirmacion no estaba atada a nada: bastaba con mandar
+   * confirm:true junto a CUALQUIER mutacion. El modelo podia pedir
+   * confirmacion para borrar el registro 11, el usuario decia que si, y la
+   * segunda llamada podia borrar el 12 sin que nadie lo notara.
+   *
+   * Ahora se guarda la consulta exacta que se aviso. La confirmacion solo
+   * vale para ESA consulta, una sola vez, y caduca.
+   */
+  private borradosPendientes = new Map<string, number>();
+  private static readonly TTL_CONFIRMACION_MS = 120000;
+
+  private normalizar(query: string): string {
+    return query.replace(/\s+/g, ' ').trim();
+  }
+
   private async executeGraphQLMutation(args: any) {
     const start = Date.now();
     try {
       const { query, variables = {}, confirm } = args;
       const isDelete = /deleteRecord\s*\(/.test(query);
-      if (isDelete && !confirm) {
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              warning: '⚠️ Esta operación eliminará un registro de forma permanente.',
-              instruction: 'Para confirmar, vuelve a llamar esta herramienta con el mismo query y añade "confirm": true en los argumentos.',
-              query: query,
-            }, null, 2),
-          }],
-        };
+      const clave = this.normalizar(query);
+
+      if (isDelete) {
+        // Limpieza de pendientes caducados.
+        const ahora = Date.now();
+        for (const [k, t] of this.borradosPendientes) {
+          if (ahora - t > MCPGraphQLServer.TTL_CONFIRMACION_MS) {
+            this.borradosPendientes.delete(k);
+          }
+        }
+
+        if (!confirm) {
+          this.borradosPendientes.set(clave, ahora);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                warning: 'Esta operacion eliminara un registro de forma permanente.',
+                instruction:
+                  'Muestra al usuario la consulta exacta y espera su aprobacion. ' +
+                  'Despues vuelve a llamar con ESTA MISMA consulta, sin cambiar ni ' +
+                  'un caracter, anadiendo "confirm": true. Si cambias el id o ' +
+                  'cualquier otra parte, la confirmacion no valdra.',
+                query,
+                validaSegundos: MCPGraphQLServer.TTL_CONFIRMACION_MS / 1000,
+              }, null, 2),
+            }],
+          };
+        }
+
+        // confirm:true, pero hay que comprobar que se confirmo ESTO.
+        const emitido = this.borradosPendientes.get(clave);
+        if (emitido === undefined) {
+          recordMetric('graphql_mutation', Date.now() - start, true);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                error:
+                  'No hay ninguna confirmacion pendiente para esta consulta exacta. ' +
+                  'Puede que hayas cambiado el id o algun otro dato respecto a la ' +
+                  'consulta que se aviso. Vuelve a llamar SIN confirm para obtener ' +
+                  'un aviso nuevo.',
+                query,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
+        // Un solo uso: se consume aqui, ejecute o falle despues.
+        this.borradosPendientes.delete(clave);
+
+        if (Date.now() - emitido > MCPGraphQLServer.TTL_CONFIRMACION_MS) {
+          recordMetric('graphql_mutation', Date.now() - start, true);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                error: 'La confirmacion caduco. Vuelve a pedirla sin confirm.',
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
       }
 
       const parsedQuery = parse(query);
@@ -314,39 +412,82 @@ class MCPGraphQLServer {
   }
 
   private async getSchemaInfo() {
-  const active = this.activeAdapter;
-  const availableQueries: string[] = ['records', 'record', 'stats'];
+    const active = this.activeAdapter;
 
-  if (active instanceof GoogleSheetsAdapter) {
-    availableQueries.push('departamentos');
+    // ANTES esta funcion llevaba su propia lista escrita a mano:
+    //
+    //     const availableQueries = ['records', 'record', 'stats'];
+    //
+    // Es decir, HABIA DOS FUENTES DE VERDAD: el esquema de GraphQL, que se
+    // genera de los datos, y esta lista, que se actualizaba a mano. Al
+    // anadir la consulta aggregate al esquema, aqui no aparecio, y el
+    // modelo —que solo lee esto— siguio afirmando que no habia
+    // agregaciones. Hizo lo correcto con la informacion que tenia.
+    //
+    // Ahora la lista se DERIVA del esquema. Si manana se anade otra
+    // consulta, aparece sola.
+    const tipoQuery = this.schema.getQueryType();
+    const tipoMutation = this.schema.getMutationType();
+
+    const describir = (tipo: any) => {
+      if (!tipo) return [];
+      return Object.values(tipo.getFields()).map((campo: any) => ({
+        nombre: campo.name,
+        descripcion: campo.description || null,
+        argumentos: campo.args.map((a: any) => ({
+          nombre: a.name,
+          tipo: String(a.type),
+          descripcion: a.description || null,
+        })),
+      }));
+    };
+
+    const consultas = describir(tipoQuery);
+    const mutaciones = describir(tipoMutation);
+
+    const campos = active.getSchema();
+    const numericos = Object.entries(campos)
+      .filter(([, info]) => info.type === 'number')
+      .map(([nombre]) => nombre);
+
+    const schemaInfo: any = {
+      source: active.getSourceName(),
+      availableSources: ['csv', 'google-sheets', 'sqlite'],
+      fields: campos,
+      consultas,
+      mutaciones,
+      directives: ['auth'],
+      exampleQueries: [
+        '{ records(limit: 10) { ' + Object.keys(campos).slice(0, 3).join(' ') + ' } }',
+        '{ stats { totalRecords source } }',
+      ],
+    };
+
+    // Los ejemplos se construyen con campos REALES de la fuente activa, no
+    // con nombres inventados que pueden no existir aqui.
+    if (numericos.length > 0) {
+      const n = numericos[0];
+      schemaInfo.exampleQueries.push(
+        `{ records(where: { ${n}: { operator: gt, value: 0 } }) { ` +
+          `${Object.keys(campos)[0]} ${n} } }`,
+        `{ records(orderBy: [{ field: "${n}", direction: "desc" }], limit: 1) { ` +
+          `${Object.keys(campos)[0]} ${n} } }`,
+        `{ aggregate(field: "${n}") { avg min max countNoNulos aviso } }`
+      );
+    }
+
+    if (active instanceof GoogleSheetsAdapter) {
+      schemaInfo.exampleQueries.push('{ departamentos { id nombre ubicacion } }');
+    }
+
+    schemaInfo.exampleQueries.push(
+      'mutation { updateRecord(id: "1", input: { salario: 70000 }) { id nombre salario } }'
+    );
+
+    schemaInfo.persistedQueries = listPersistedQueries();
+
+    return { content: [{ type: 'text', text: JSON.stringify(schemaInfo, null, 2) }] };
   }
-
-  const schemaInfo: any = {
-    source: active.getSourceName(),
-    availableSources: ['csv', 'google-sheets', 'sqlite'],
-    fields: active.getSchema(),
-    availableQueries,
-    directives: ['auth'],
-    exampleQueries: [
-      '{ records { id nombre email } }',
-      '{ record(id: "1") { nombre ciudad } }',
-    ],
-  };
-
-  if (active instanceof GoogleSheetsAdapter) {
-    schemaInfo.exampleQueries.push('{ departamentos { id nombre ubicacion } }');
-  }
-
-  schemaInfo.exampleQueries.push(
-    'mutation { createRecord(input: { nombre: "Nuevo", email: "nuevo@email.com" }) { id nombre } }',
-    'mutation { updateRecord(id: "1", input: { salario: 70000 }) { id nombre salario } }',
-    'mutation { deleteRecord(id: "11") }'
-  );
-
-  schemaInfo.persistedQueries = listPersistedQueries();
-
-  return { content: [{ type: 'text', text: JSON.stringify(schemaInfo, null, 2) }] };
-}
 
   private setupErrorHandling() {
     this.server.onerror = (error) => {
