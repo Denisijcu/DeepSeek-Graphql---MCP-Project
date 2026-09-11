@@ -145,8 +145,4 @@ export class CSVAdapter extends BaseAdapter {
     
     await fs.writeFile(this.filePath, csvString, 'utf-8');
   }
-
-  private clearCache(): void {
-    this.cache.clear();
-  }
 }

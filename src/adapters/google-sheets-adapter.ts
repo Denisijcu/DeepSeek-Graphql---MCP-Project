@@ -176,8 +176,4 @@ export class GoogleSheetsAdapter extends BaseAdapter {
 
     return { type, nullable, unique, description: `Campo ${fieldName} de Google Sheets` };
   }
-
-  private clearCache(): void {
-    this.cache.clear();
-  }
 }

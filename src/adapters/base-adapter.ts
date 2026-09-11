@@ -50,6 +50,24 @@ export abstract class BaseAdapter implements DataAdapter {
   protected cache: Map<string, { data: any[]; timestamp: number }> = new Map();
   protected cacheTTL: number = 60000;
 
+  /**
+   * Version de los datos. Sube en cada modificacion.
+   *
+   * Existe porque limpiar la cache con cache.clear() no bastaba: cada
+   * adaptador tenia su propio clearCache privado, y una lectura que
+   * entrara mientras la recarga estaba a medias se quedaba con datos
+   * viejos durante todo el TTL.
+   *
+   * Sintoma observado: se borra un registro, el servidor confirma el
+   * borrado, y la consulta siguiente devuelve el registro borrado. El
+   * modelo concluye que "la operacion no se persistio" y lo dice al
+   * usuario, cuando el dato ya no estaba en el disco.
+   *
+   * Con la version dentro de la clave, una entrada vieja NO PUEDE
+   * servirse: su clave ya no coincide con la que se busca.
+   */
+  protected dataVersion = 0;
+
   abstract initialize(): Promise<void>;
   abstract getData(options?: QueryOptions): Promise<any[]>;
 
@@ -71,8 +89,21 @@ export abstract class BaseAdapter implements DataAdapter {
   }
 
   protected getCacheKey(options?: QueryOptions): string {
-    if (!options) return 'all';
-    return JSON.stringify(options);
+    // La version va DENTRO de la clave. Es lo que hace imposible servir
+    // datos de antes de una modificacion.
+    const base = options ? JSON.stringify(options) : 'all';
+    return `v${this.dataVersion}::${base}`;
+  }
+
+  /**
+   * Invalida la cache. Llamar SIEMPRE despues de modificar datos.
+   *
+   * Antes cada adaptador tenia su propia version privada de este metodo.
+   * Ahora es una sola, protegida, y ademas sube la version.
+   */
+  protected clearCache(): void {
+    this.cache.clear();
+    this.dataVersion++;
   }
 
   protected getFromCache(key: string): any[] | null {

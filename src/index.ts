@@ -104,11 +104,24 @@ class MCPGraphQLServer {
         },
         {
           name: 'graphql_mutation',
-          description: 'Ejecuta una mutación GraphQL. Para eliminar, primero pide confirmación y luego llama con confirm: true',
+          description:
+            'Ejecuta una mutacion GraphQL (createRecord, updateRecord, deleteRecord) ' +
+            'contra la fuente ACTIVA. Para eliminar, llama primero sin confirm para ' +
+            'obtener el aviso, y despues con confirm: true y el MISMO id. ' +
+            'DECLARA SIEMPRE el parametro "source" con la fuente sobre la que crees ' +
+            'que estas trabajando: si no coincide con la activa, la operacion se ' +
+            'rechaza en vez de escribir donde no debe.',
           inputSchema: {
             type: 'object',
             properties: {
               query: { type: 'string', description: 'La mutación GraphQL' },
+              source: {
+                type: 'string',
+                enum: ['csv', 'google-sheets', 'sqlite'],
+                description:
+                  'Fuente sobre la que crees estar trabajando. Se comprueba contra ' +
+                  'la activa antes de ejecutar nada.',
+              },
               variables: { type: 'object', description: 'Variables opcionales', optional: true },
               confirm: { type: 'boolean', description: 'Confirmación para DELETE', optional: true },
             },
@@ -194,6 +207,14 @@ class MCPGraphQLServer {
           throw new Error(`Unknown tool: ${name}`);
       }
     });
+  }
+
+  /** Nombre corto de la fuente activa: csv, google-sheets o sqlite. */
+  private claveFuenteActiva(): string {
+    if (this.activeAdapter === this.csvAdapter) return 'csv';
+    if (this.activeAdapter === this.sheetsAdapter) return 'google-sheets';
+    if (this.activeAdapter === this.sqliteAdapter) return 'sqlite';
+    return 'desconocida';
   }
 
   private async switchSource(args: any) {
@@ -285,71 +306,95 @@ class MCPGraphQLServer {
   }
 
   /**
-   * Borrados pendientes de confirmar.
+   * Borrados pendientes de confirmar, indexados por OBJETIVO.
    *
-   * Antes, la confirmacion no estaba atada a nada: bastaba con mandar
-   * confirm:true junto a CUALQUIER mutacion. El modelo podia pedir
-   * confirmacion para borrar el registro 11, el usuario decia que si, y la
-   * segunda llamada podia borrar el 12 sin que nadie lo notara.
+   * Historia de este mecanismo, en tres versiones:
    *
-   * Ahora se guarda la consulta exacta que se aviso. La confirmacion solo
-   * vale para ESA consulta, una sola vez, y caduca.
+   *   v1: confirm:true valia para cualquier mutacion. El modelo podia
+   *       pedir confirmacion para borrar el registro 11, el usuario
+   *       aprobarlo, y la segunda llamada borrar el 12.
+   *
+   *   v2: se ataba a la consulta EXACTA, normalizando espacios. Bloqueaba
+   *       el ataque y bloqueaba tambien el uso legitimo: el modelo
+   *       reescribe la consulta en cada intento, asi que la confirmada
+   *       nunca coincidia con la avisada. Observado en pruebas: cuatro
+   *       intentos, ningun borrado, y el modelo inventandose un ritual
+   *       ("dime: Confirma la eliminacion del empleado 1") para intentar
+   *       satisfacer un mecanismo que no entendia.
+   *
+   *   v3, esta: se ata al OBJETIVO, no al texto. La clave es el id que se
+   *       va a borrar. El modelo puede reescribir la consulta como quiera;
+   *       lo que no puede es confirmar el borrado de OTRO registro.
+   *
+   * Que una proteccion bloquee tambien el camino legitimo no es "ser
+   * estricto": es empujar a que alguien la desactive entera.
    */
   private borradosPendientes = new Map<string, number>();
   private static readonly TTL_CONFIRMACION_MS = 120000;
 
-  private normalizar(query: string): string {
-    return query.replace(/\s+/g, ' ').trim();
+  /**
+   * Extrae el id que la mutacion pretende borrar.
+   *
+   * Devuelve null si no se puede determinar, y en ese caso la operacion
+   * se rechaza: si no se sabe QUE se va a borrar, no se puede confirmar
+   * nada.
+   */
+  private objetivoDelBorrado(query: string): string | null {
+    const m = query.match(/deleteRecord\s*\(\s*id\s*:\s*"([^"]+)"/)
+      || query.match(/deleteRecord\s*\(\s*id\s*:\s*([\w-]+)/);
+    return m?.[1] ?? null;
   }
 
   private async executeGraphQLMutation(args: any) {
     const start = Date.now();
     try {
-      const { query, variables = {}, confirm } = args;
+      const { query, variables = {}, confirm, source } = args;
+
+      // Comprobacion de fuente ANTES de tocar nada.
+      //
+      // Existe por un incidente real: el modelo creia estar en SQLite,
+      // nunca llamo a switch_source, y creo y borro registros en Google
+      // Sheets. El servidor no tenia forma de saber que se estaba
+      // equivocando, porque la fuente activa es un estado invisible para
+      // quien llama.
+      //
+      // Con esto, el modelo DECLARA sobre que cree trabajar y el servidor
+      // lo verifica. Una suposicion se convierte en algo comprobable.
+      const activa = this.claveFuenteActiva();
+
+      if (source && source !== activa) {
+        recordMetric('graphql_mutation', Date.now() - start, true);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              error:
+                `Operacion CANCELADA. Declaraste trabajar sobre "${source}" pero ` +
+                `la fuente activa es "${activa}" (${this.activeAdapter.getSourceName()}). ` +
+                `No se ha modificado nada. Llama a switch_source con "${source}" ` +
+                `y vuelve a intentarlo.`,
+              fuenteDeclarada: source,
+              fuenteActiva: activa,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
       const isDelete = /deleteRecord\s*\(/.test(query);
-      const clave = this.normalizar(query);
 
       if (isDelete) {
-        // Limpieza de pendientes caducados.
-        const ahora = Date.now();
-        for (const [k, t] of this.borradosPendientes) {
-          if (ahora - t > MCPGraphQLServer.TTL_CONFIRMACION_MS) {
-            this.borradosPendientes.delete(k);
-          }
-        }
+        const objetivo = this.objetivoDelBorrado(query);
 
-        if (!confirm) {
-          this.borradosPendientes.set(clave, ahora);
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                warning: 'Esta operacion eliminara un registro de forma permanente.',
-                instruction:
-                  'Muestra al usuario la consulta exacta y espera su aprobacion. ' +
-                  'Despues vuelve a llamar con ESTA MISMA consulta, sin cambiar ni ' +
-                  'un caracter, anadiendo "confirm": true. Si cambias el id o ' +
-                  'cualquier otra parte, la confirmacion no valdra.',
-                query,
-                validaSegundos: MCPGraphQLServer.TTL_CONFIRMACION_MS / 1000,
-              }, null, 2),
-            }],
-          };
-        }
-
-        // confirm:true, pero hay que comprobar que se confirmo ESTO.
-        const emitido = this.borradosPendientes.get(clave);
-        if (emitido === undefined) {
-          recordMetric('graphql_mutation', Date.now() - start, true);
+        if (!objetivo) {
           return {
             content: [{
               type: 'text',
               text: JSON.stringify({
                 error:
-                  'No hay ninguna confirmacion pendiente para esta consulta exacta. ' +
-                  'Puede que hayas cambiado el id o algun otro dato respecto a la ' +
-                  'consulta que se aviso. Vuelve a llamar SIN confirm para obtener ' +
-                  'un aviso nuevo.',
+                  'No se pudo determinar que registro se quiere borrar. Usa la ' +
+                  'forma deleteRecord(id: "...") con el id literal, no una ' +
+                  'variable.',
                 query,
               }, null, 2),
             }],
@@ -357,7 +402,62 @@ class MCPGraphQLServer {
           };
         }
 
-        // Un solo uso: se consume aqui, ejecute o falle despues.
+        const ahora = Date.now();
+        for (const [k, t] of this.borradosPendientes) {
+          if (ahora - t > MCPGraphQLServer.TTL_CONFIRMACION_MS) {
+            this.borradosPendientes.delete(k);
+          }
+        }
+
+        const clave = `${this.activeAdapter.getSourceName()}::${objetivo}`;
+
+        if (!confirm) {
+          this.borradosPendientes.set(clave, ahora);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                warning: `Se va a eliminar de forma permanente el registro ${objetivo}.`,
+                fuente: this.activeAdapter.getSourceName(),
+                registro: objetivo,
+                instruction:
+                  'Muestra al usuario QUE registro se va a borrar y espera su ' +
+                  'aprobacion. Despues vuelve a llamar a esta misma herramienta ' +
+                  `borrando el id ${objetivo} y anadiendo "confirm": true. ` +
+                  'No hace falta que la consulta sea identica, pero el id SI ' +
+                  'tiene que ser el mismo.',
+                validaSegundos: MCPGraphQLServer.TTL_CONFIRMACION_MS / 1000,
+              }, null, 2),
+            }],
+          };
+        }
+
+        const emitido = this.borradosPendientes.get(clave);
+
+        if (emitido === undefined) {
+          const pendientes = [...this.borradosPendientes.keys()]
+            .map((k) => k.split('::')[1])
+            .filter(Boolean);
+
+          recordMetric('graphql_mutation', Date.now() - start, true);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                error:
+                  `No hay confirmacion pendiente para el registro ${objetivo}.` +
+                  (pendientes.length
+                    ? ` Hay una pendiente para: ${pendientes.join(', ')}. ` +
+                      `Si de verdad quieres borrar el ${objetivo}, pide primero ` +
+                      `el aviso llamando SIN confirm.`
+                    : ' Llama primero sin confirm para obtener el aviso.'),
+                registroSolicitado: objetivo,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+
         this.borradosPendientes.delete(clave);
 
         if (Date.now() - emitido > MCPGraphQLServer.TTL_CONFIRMACION_MS) {
@@ -389,7 +489,18 @@ class MCPGraphQLServer {
       });
 
       recordMetric('graphql_mutation', Date.now() - start, !!result.errors);
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      // La fuente viaja SIEMPRE en la respuesta. Asi el modelo no puede
+      // arrastrar una suposicion equivocada de una llamada a la siguiente.
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ...result,
+            fuenteActiva: activa,
+            fuenteNombre: this.activeAdapter.getSourceName(),
+          }, null, 2),
+        }],
+      };
     } catch (error: any) {
       recordMetric('graphql_mutation', Date.now() - start, true);
       return { content: [{ type: 'text', text: JSON.stringify({ error: error.message }) }], isError: true };

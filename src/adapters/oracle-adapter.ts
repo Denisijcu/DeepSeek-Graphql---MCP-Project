@@ -133,10 +133,6 @@ export class OracleAdapter extends BaseAdapter {
     return { type, nullable, unique, description: `Campo ${fieldName} de Oracle` };
   }
 
-  private clearCache(): void {
-    this.cache.clear();
-  }
-
   async close(): Promise<void> {
     if (this.connection) {
       await this.connection.close();

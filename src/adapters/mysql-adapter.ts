@@ -100,7 +100,4 @@ export class MySQLAdapter extends BaseAdapter {
     return { type, nullable, unique, description: `Campo ${fieldName} de MySQL` };
   }
 
-  private clearCache(): void {
-    this.cache.clear();
-  }
 }

@@ -114,8 +114,4 @@ export class SQLiteAdapter extends BaseAdapter {
 
     return { type, nullable, unique, description: `Campo ${fieldName} de SQLite` };
   }
-
-  private clearCache(): void {
-    this.cache.clear();
-  }
 }

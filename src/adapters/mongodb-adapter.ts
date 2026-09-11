@@ -142,7 +142,4 @@ export class MongoDBAdapter extends BaseAdapter {
     return { type, nullable, unique, description: `Campo ${fieldName} de MongoDB` };
   }
 
-  private clearCache(): void {
-    this.cache.clear();
-  }
 }

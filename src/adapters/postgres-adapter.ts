@@ -104,7 +104,4 @@ export class PostgresAdapter extends BaseAdapter {
     return { type, nullable, unique, description: `Campo ${fieldName} de PostgreSQL` };
   }
 
-  private clearCache(): void {
-    this.cache.clear();
-  }
 }

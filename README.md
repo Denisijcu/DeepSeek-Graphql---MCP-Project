@@ -148,12 +148,26 @@ Reinicia la conversación para que el modelo reconozca las herramientas.
 
 - `graphql_query` – Ejecuta consultas GraphQL.
 - `graphql_batch` – Ejecuta varias consultas en una llamada.
-- `graphql_mutation` – Crea, actualiza o elimina registros (con confirmación para DELETE).
+- `graphql_mutation` – Crea, actualiza o elimina registros. Acepta `source` para
+  declarar sobre qué fuente crees estar trabajando; si no coincide con la activa,
+  la operación se cancela sin tocar nada.
 - `switch_source` – Cambia la fuente de datos activa.
 - `list_sources` – Lista las fuentes disponibles.
 - `register_persisted_query` – Registra una consulta persistida.
 - `get_metrics` – Obtiene métricas de rendimiento.
-- `get_schema` – Muestra el esquema de la fuente activa.
+- `get_schema` – Muestra el esquema de la fuente activa, derivado del esquema real.
+
+### Agregaciones
+
+```graphql
+{ aggregate(field: "salario") { avg min max sum countNoNulos aviso } }
+```
+
+Devuelve las cinco operaciones a la vez, con **nombres fijos** (no alias dinámicos del
+tipo `salario_avg`). El campo `aviso` aparece cuando hay algo que el usuario debería
+saber: filas sin dato, o un campo que no es numérico.
+
+Evita que el modelo se traiga todos los registros para calcular una media él mismo.
 
 ## 🧪 Ejemplos de consultas
 
@@ -214,7 +228,27 @@ mutation {
 }
 ```
 
-La primera llamada devuelve una advertencia; el modelo debe llamar de nuevo con `confirm: true`.
+La primera llamada devuelve un aviso con el registro concreto que se va a borrar. La
+segunda debe llevar `confirm: true` **y el mismo id**.
+
+La confirmación está atada al **objetivo**, no al texto de la consulta: el modelo puede
+reescribir la mutación, pero no puede confirmar el borrado de otro registro. Es de un
+solo uso y caduca a los 120 segundos.
+
+### Declarar la fuente en las mutaciones
+
+```json
+{
+  "query": "mutation { deleteRecord(id: \"1\") }",
+  "source": "sqlite",
+  "confirm": true
+}
+```
+
+Si `source` no coincide con la fuente activa, la operación se cancela **sin modificar
+nada** y el error dice qué hacer. Existe porque la fuente activa es un estado invisible
+para quien llama, y una suposición equivocada puede escribir en la base de datos que no
+era.
 
 ## 🔌 Adaptadores incluidos
 
@@ -232,11 +266,80 @@ Consulta `EXTRA.md` para más detalles sobre los adaptadores de base de datos.
 
 ## 🧰 Solución de problemas
 
-- **El modelo no cambia de fuente**: Refuerza el system prompt con instrucciones claras sobre `switch_source`.
-- **Error de tipos en GraphQL**: Asegúrate de que el esquema se haya inferido correctamente (revisa logs de inicialización).
-- **Google Sheets no carga**: Verifica que la URL de Apps Script sea pública y que el nombre de la hoja coincida.
-- **SQLite no funciona**: Comprueba que la base de datos exista y tenga la tabla indicada.
-- **Error de compilación TS5055**: Revisa que `tsconfig.json` incluya solo `src/**/*` y no archivos sueltos en la raíz.
+- **El modelo escribe en la fuente equivocada**: pasa cuando asume que ya cambió de
+  fuente sin llamar a `switch_source`. Desde la v0.5 las mutaciones aceptan `source` y
+  el servidor lo verifica antes de ejecutar. Revisa que el modelo lo esté declarando.
+- **Compilar no despliega**: tras `npm run build` hay que **reiniciar el proceso del
+  servidor**. Cerrar la ventana del cliente no siempre lo mata. Si arreglas algo y el
+  comportamiento no cambia, empieza por aquí.
+- **El servidor probado no es el que usa el cliente**: `dotenv` busca el `.env` en el
+  directorio de trabajo **actual**, que no es el de tu proyecto cuando lo lanza el
+  cliente. Pon todas las variables en la configuración del cliente MCP, con rutas
+  absolutas.
+- **Un visor de base de datos muestra datos viejos**: los visores cachean al abrir el
+  archivo y no se enteran de los cambios de otros procesos. Recarga antes de concluir
+  que algo no se guardó.
+- **Error de tipos en GraphQL**: revisa los logs de inicialización para ver el esquema
+  inferido.
+- **Google Sheets no carga**: verifica que la URL de Apps Script sea accesible y que el
+  nombre de la hoja coincida.
+- **SQLite no funciona**: comprueba que la base de datos exista y tenga la tabla
+  indicada.
+- **Error de compilación TS5055**: revisa que `tsconfig.json` incluya solo `src/**/*`.
+
+## 📝 Cambios recientes
+
+### v0.5 — correcciones de integridad
+
+Salieron de probar el servidor contra un modelo local y observar qué hacía. Todas
+compilaban sin error antes del arreglo.
+
+**Datos**
+
+- Las comparaciones y la ordenación se hacían sobre **texto**: en CSV y Google Sheets
+  todo llega como cadena, así que `"9" > "50000"` era verdadero. Un salario de nueve
+  mil apareciendo en un filtro de "mayor que cincuenta mil". Añadido `coaccionar()`,
+  que convierte según el tipo declarado antes de comparar.
+- La caché podía servir datos de antes de una modificación. Ahora la clave lleva un
+  número de versión que sube en cada cambio: una entrada vieja no puede servirse.
+- `clearCache` estaba duplicado en los **siete** adaptadores. Ahora hay uno solo en
+  `BaseAdapter`.
+- Un filtro sin valor devolvía lista vacía en silencio, y el modelo entraba en bucle
+  reescribiendo la consulta. Ahora lanza un error que explica la sintaxis correcta.
+
+**Esquema**
+
+- Todos los tipos se llamaban `Record`, en todas las fuentes. Con dos fuentes de
+  campos parecidos, el modelo no tenía nada con que distinguirlas. Ahora el nombre
+  incluye la fuente: `RecordSqliteEmpleados`.
+- `get_schema` llevaba su **propia lista** de consultas escrita a mano. Al añadir
+  `aggregate` al esquema, ahí no aparecía, y el modelo seguía diciendo que no había
+  agregaciones. Ahora se deriva del esquema real.
+- Cada campo se podía filtrar de dos maneras: por `where` y por un argumento suelto.
+  Se pagaba dos veces en el esquema. Eliminados los sueltos.
+- La consulta `departamentos` se declaraba siempre, incluso en fuentes sin tabla de
+  departamentos. Ahora solo donde existe.
+- Expuestas las agregaciones, que ya estaban implementadas y no se podían usar.
+
+**Seguridad**
+
+- La confirmación de borrado no estaba atada a nada: `confirm: true` valía para
+  cualquier mutación. Se podía aprobar el borrado del registro 11 y ejecutar el del 12.
+  Ahora se ata al id, es de un solo uso y caduca.
+- Las mutaciones aceptan `source` y el servidor lo verifica. Evita escribir en la
+  fuente equivocada cuando el modelo asume mal.
+
+**Adaptadores de base de datos**
+
+- MongoDB comparaba `_id` como cadena contra un `ObjectId`: no coincidía nunca.
+- `deleteRecord` de MongoDB devolvía `true` aunque no borrara nada.
+- Oracle no compilaba por falta de tipos. Añadido `src/types/oracledb.d.ts`.
+
+### Estado de los adaptadores
+
+Los cuatro de base de datos **compilan pero no se han ejecutado** contra un servidor
+real. En el único que se revisó a fondo, MongoDB, aparecieron dos bugs de lógica que
+solo se ven al conectarse. Es razonable esperar más en los otros.
 
 ## 📄 Licencia
 
